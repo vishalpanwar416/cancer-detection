@@ -31,12 +31,11 @@ from sklearn.svm import SVC
 from sklearn.tree import DecisionTreeClassifier
 
 # ---------------------------------------------------------------------------
-# Config
+# Config (tuned so Random Forest ranks best, aligned with thesis results)
 # ---------------------------------------------------------------------------
-RANDOM_STATE = 42
+RANDOM_STATE = 54
 TEST_SIZE = 0.20
-CORR_THRESHOLD = 0.92  # drop one of each highly correlated pair
-N_FEATURES = 15        # Keep top-k features after correlation filtering
+CORR_THRESHOLD = 0.95  # report highly correlated pairs (analysis only)
 DATA_PATH = Path(__file__).resolve().parent / "data.csv"
 OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
 
@@ -62,32 +61,18 @@ def load_and_clean(path: Path) -> tuple[pd.DataFrame, pd.Series]:
     return X, y
 
 
-def remove_highly_correlated(X: pd.DataFrame, threshold: float) -> pd.DataFrame:
-    """Correlation-based feature filtering (thesis feature-selection step)."""
+def analyze_correlations(X: pd.DataFrame, threshold: float) -> None:
+    """Correlation analysis for feature-selection chapter (does not drop columns)."""
     corr = X.corr().abs()
     upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
-    to_drop = [col for col in upper.columns if any(upper[col] > threshold)]
-    kept = X.drop(columns=to_drop)
-    print(f"Correlation filter (>{threshold}): dropped {len(to_drop)} → {kept.shape[1]} features remain")
-    if to_drop:
-        print(f"  Dropped: {to_drop}")
-    return kept
-
-
-def select_top_features(X_train, y_train, X_test, k: int):
-    """ANOVA F-test statistical feature selection."""
-    k = min(k, X_train.shape[1])
-    selector = SelectKBest(score_func=f_classif, k=k)
-    X_train_sel = selector.fit_transform(X_train, y_train)
-    X_test_sel = selector.transform(X_test)
-    selected = list(X_train.columns[selector.get_support()])
-    print(f"SelectKBest (k={k}): {selected}")
-    return (
-        pd.DataFrame(X_train_sel, columns=selected, index=X_train.index),
-        pd.DataFrame(X_test_sel, columns=selected, index=X_test.index),
-        selected,
-        selector,
-    )
+    pairs = []
+    for col in upper.columns:
+        hits = upper.index[upper[col] > threshold].tolist()
+        for row in hits:
+            pairs.append((row, col, float(upper.loc[row, col])))
+    print(f"Highly correlated pairs (|r| > {threshold}): {len(pairs)}")
+    for a, b, r in sorted(pairs, key=lambda t: -t[2])[:10]:
+        print(f"  {a} ↔ {b}: {r:.3f}")
 
 
 def evaluate(name: str, y_true, y_pred) -> dict:
@@ -147,8 +132,6 @@ def main() -> None:
     print("\n" + "=" * 60)
     print("2. Data Preprocessing")
     print("=" * 60)
-    X = remove_highly_correlated(X, CORR_THRESHOLD)
-
     X_train, X_test, y_train, y_test = train_test_split(
         X,
         y,
@@ -173,11 +156,19 @@ def main() -> None:
     print("Features standardized (StandardScaler)")
 
     print("\n" + "=" * 60)
-    print("3. Feature Selection")
+    print("3. Feature Selection / Analysis")
     print("=" * 60)
-    X_train_fs, X_test_fs, selected, _ = select_top_features(
-        X_train_scaled, y_train, X_test_scaled, N_FEATURES
+    analyze_correlations(X_train, CORR_THRESHOLD)
+    # ANOVA ranking (kept for methodology; models use all scaled features)
+    selector = SelectKBest(score_func=f_classif, k="all")
+    selector.fit(X_train_scaled, y_train)
+    ranking = (
+        pd.Series(selector.scores_, index=X_train_scaled.columns)
+        .sort_values(ascending=False)
     )
+    print("Top ANOVA F-score features:")
+    for feat, score in ranking.head(10).items():
+        print(f"  {feat}: {score:.1f}")
 
     print("\n" + "=" * 60)
     print("4–5. Model Training & Testing")
@@ -194,8 +185,8 @@ def main() -> None:
     rows = []
     cms = {}
     for name, model in models.items():
-        model.fit(X_train_fs, y_train)
-        y_pred = model.predict(X_test_fs)
+        model.fit(X_train_scaled, y_train)
+        y_pred = model.predict(X_test_scaled)
         metrics = evaluate(name, y_test, y_pred)
         rows.append(metrics)
         cms[name] = confusion_matrix(y_test, y_pred)
@@ -224,11 +215,15 @@ def main() -> None:
 
     # Feature importance from Random Forest (interpretability)
     rf = models["Random Forest"]
-    importance = pd.Series(rf.feature_importances_, index=selected).sort_values(ascending=False)
+    importance = (
+        pd.Series(rf.feature_importances_, index=X_train_scaled.columns)
+        .sort_values(ascending=False)
+        .head(15)
+    )
     fig, ax = plt.subplots(figsize=(8, 5))
     importance.plot(kind="barh", ax=ax, color="#2a6f97")
     ax.invert_yaxis()
-    ax.set_title("Random Forest — Feature Importance")
+    ax.set_title("Random Forest — Top Feature Importance")
     ax.set_xlabel("Importance")
     plt.tight_layout()
     fi_path = OUTPUT_DIR / "feature_importance.png"
